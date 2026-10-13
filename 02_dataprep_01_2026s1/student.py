@@ -5,7 +5,6 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
-
 """
 ASSIGNMENT 2 (STUDENT VERSION)
 
@@ -39,12 +38,11 @@ def Q2(df):
     """
     dropped_1 = df.loc[:, df.isnull().mean() <= 0.5]
 
-    cols = dropped_1.columns.difference(["Age", "Fare"])
-    flat_values = dropped_1[cols].apply(
-        lambda col: col.value_counts(normalize=True, dropna=False).max()
-    )
-    to_drop = flat_values[flat_values > 0.7].index
+    flat_values = dropped_1.loc[
+        :, (dropped_1.columns != "Age") | (dropped_1.columns != "Fare")
+    ].apply(lambda col: col.value_counts(normalize=True, dropna=False).max())
 
+    to_drop = flat_values[flat_values > 0.7].index
     dropped_2 = dropped_1.drop(columns=to_drop)
 
     return dropped_2.shape[1]
@@ -57,8 +55,7 @@ def Q3(df):
     Remove all rows with missing values in the target variable "Survived".
     How many rows remain?
     """
-    # TODO: Code here
-    return None
+    return df[df["Survived"].notnull()].shape[0]
 
 
 def Q4(df):
@@ -74,8 +71,14 @@ def Q4(df):
 
     Hint: Use round(_, 2).
     """
-    # TODO: Code here
-    return None
+    q1 = df["Fare"].quantile(0.25)
+    q3 = df["Fare"].quantile(0.75)
+    iqr = q3 - q1
+
+    df[df["Fare"] < q1 - 1.5 * iqr] = q1 - 1.5 * iqr
+    df[df["Fare"] > q3 + 1.5 * iqr] = q3 + 1.5 * iqr
+
+    return round(df["Fare"].mean(), 2)
 
 
 def Q5(df):
@@ -93,8 +96,25 @@ def Q5(df):
 
     Hint: Use Pipeline, SimpleImputer, ColumnTransformer, and round(_, 2).
     """
-    # TODO: Code here
-    return None
+    nums = df.select_dtypes(include="number")
+
+    target = ["Survived"]
+
+    X_cols = nums.columns.difference(target)
+    Y_cols = nums.columns.intersection(target)
+
+    imp_mean = SimpleImputer(strategy="mean")
+    ct = ColumnTransformer(
+        [(f"t{i}", imp_mean, [col]) for (i, col) in enumerate(X_cols)]
+    )
+    pipe = Pipeline([("ct", ct)])
+
+    pipe.set_output(transform="pandas")
+    pipe.fit(df[X_cols], df[Y_cols])
+
+    mean = pipe.transform(df[X_cols])["t0__Age"].mean()
+
+    return round(mean, 2)
 
 
 def Q6(df):
@@ -114,8 +134,41 @@ def Q6(df):
 
     Hint: Check drop, handle_unknown, sparse_output, and use round(_, 2).
     """
-    # TODO: Code here
-    return None
+    nums = df.select_dtypes(include="number")
+
+    target = ["Survived"]
+
+    X_num_cols = nums.columns.difference(target)
+    X_embarked = df.columns.intersection(["Embarked"])
+
+    ct = ColumnTransformer(
+        [
+            ("t_num", SimpleImputer(strategy="mean"), X_num_cols),
+            (
+                "t_cat",
+                Pipeline(
+                    [
+                        ("imp_freq", SimpleImputer(strategy="most_frequent")),
+                        (
+                            "ohe",
+                            OneHotEncoder(handle_unknown="ignore", sparse_output=False),
+                        ),
+                    ]
+                ),
+                X_embarked,
+            ),
+        ],
+        verbose_feature_names_out=False,
+    )
+
+    pipe = Pipeline([("ct", ct)])
+
+    pipe.set_output(transform="pandas")
+    pipe.fit(df, df)
+
+    pipe.transform(df)
+    mean = pipe.transform(df)["Embarked_Q"].mean()
+    return round(mean, 2)
 
 
 def Q7(df):
@@ -133,5 +186,12 @@ def Q7(df):
     Hint: Use dropna(), round(_, 2), and train_test_split() from
     sklearn.model_selection.
     """
-    # TODO: Code here
-    return None
+    cleaned = df[df["Survived"].notnull()]
+
+    X = cleaned.loc[:, cleaned.columns != "Survived"]
+    y = cleaned["Survived"]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.3, random_state=123, stratify=y
+    )
+    return round(y_train.mean(), 2)
