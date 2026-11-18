@@ -72,51 +72,19 @@ SILVER_SCHEMA = Schema.of(
     required("ride_date", DateType()),
 )
 
-bronze = None
-silver = None
-
 BKK = ZoneInfo("Asia/Bangkok")
 
 
-def q1(catalog: Catalog):  # DO NOT modify this line
-    global bronze, silver
-    # Already answered: the namespaces and both tables, in ONE transaction, "q1: create tables".
-    with catalog.begin_transaction():
-        catalog.set_commit_message("q1: create tables")
-        catalog.create_namespace("bronze")
-        catalog.create_namespace("silver")
-        bronze = catalog.create_table(("bronze", "rentals_raw"), BRONZE_SCHEMA)
-        silver = catalog.create_table(("silver", "rentals"), SILVER_SCHEMA)
-    return {
-        namespace: sorted(name for _, name in catalog.list_tables(namespace))
-        for namespace in ("bronze", "silver")
-    }
-
-
-def q2(catalog: Catalog, csv_path: str):  # DO NOT modify this line
-    # Part A, ingest into bronze:
-    # - file guard: skip the whole file if bronze already has a row with its SHA-256;
-    # - row guard: drop a row whose rental_id is already in bronze, or earlier in the same file
-    #   (keep the first);
-    # - append what is left in one transaction, "q2: bronze ingest rentals_2026-06.csv".
-    # Part B, transform into silver ("q2: silver transform"): bronze rows whose rental_id isn't
-    # in silver yet (NOT EXISTS), trimmed, typed with TRY_CAST, ride_date in Bangkok time,
-    # validated by the handout's rules, one per rental_id (QUALIFY).
-    # Return {'bronze_appended': int, 'silver_appended': int, 'rejected': int}.
-
+def ingest(catalog: Catalog, csv_path: str):
+    bronze = catalog.load_table(("bronze", "rentals_raw"))
     con = catalog.connection
-
-    """-------------------- Part A --------------------"""
 
     file_bytes = Path(csv_path).read_bytes()
     file_hash = hashlib.sha256(file_bytes).hexdigest()
 
     # Guard 1: the exact same file was ingested before
     if bronze.scan(f"file_sha256 = '{file_hash}'").count() > 0:
-        print(
-            f"SKIP {csv_path.name}: this file (sha256 {file_hash[:12]}...) is already in bronze"
-        )
-        return 0
+        return None
 
     # Read every column as text: bronze keeps source values as they arrived
     raw = pacsv.read_csv(
@@ -154,26 +122,12 @@ def q2(catalog: Catalog, csv_path: str):  # DO NOT modify this line
     """).to_arrow_table()
     con.unregister("incoming")
 
-    # duplicates = n - new_rows.num_rows
-    # if new_rows.num_rows == 0:
-    #     print(
-    #         f"SKIP {csv_path.name}: all {n} rows are duplicates of rows already in bronze"
-    #     )
-    #     return 0
+    return new_rows
 
-    with catalog.begin_transaction() as txn:
-        catalog.set_commit_message(
-            f"q2: bronze ingest rentals_2026-06.csv", author="jsudo"
-        )
-        txn.load_table(("bronze", "rentals_raw")).append(new_rows)
 
-    bronze_appended = new_rows.num_rows
+def transform(catalog: Catalog):
+    con = catalog.connection
 
-    # print(
-    #     f"OK   {csv_path.name}: {n} rows read, {new_rows.num_rows} appended, {duplicates} duplicates skipped"
-    # )
-
-    """-------------------- Part B --------------------"""
     TRANSFORM_SQL = """
     WITH new_rows AS (               -- 1. bronze rows that are not in silver yet
         SELECT b.*
@@ -231,19 +185,53 @@ def q2(catalog: Catalog, csv_path: str):  # DO NOT modify this line
     """).df().n[0]
     clean = con.sql(TRANSFORM_SQL).to_arrow_table()
 
-    # if clean.num_rows == 0:
-    #     print(
-    #         f"Nothing to do: {pending} bronze rows not yet in silver, 0 valid rows to append"
-    #     )
-    #     return 0
+    return pending, clean
 
+
+def q1(catalog: Catalog):  # DO NOT modify this line
+    # Already answered: the namespaces and both tables, in ONE transaction, "q1: create tables".
+    with catalog.begin_transaction():
+        catalog.set_commit_message("q1: create tables")
+        catalog.create_namespace("bronze")
+        catalog.create_namespace("silver")
+        catalog.create_table(("bronze", "rentals_raw"), BRONZE_SCHEMA)
+        catalog.create_table(("silver", "rentals"), SILVER_SCHEMA)
+    return {
+        namespace: sorted(name for _, name in catalog.list_tables(namespace))
+        for namespace in ("bronze", "silver")
+    }
+
+
+def q2(catalog: Catalog, csv_path: str):  # DO NOT modify this line
+    # Part A, ingest into bronze:
+    # - file guard: skip the whole file if bronze already has a row with its SHA-256;
+    # - row guard: drop a row whose rental_id is already in bronze, or earlier in the same file
+    #   (keep the first);
+    # - append what is left in one transaction, "q2: bronze ingest rentals_2026-06.csv".
+    # Part B, transform into silver ("q2: silver transform"): bronze rows whose rental_id isn't
+    # in silver yet (NOT EXISTS), trimmed, typed with TRY_CAST, ride_date in Bangkok time,
+    # validated by the handout's rules, one per rental_id (QUALIFY).
+    # Return {'bronze_appended': int, 'silver_appended': int, 'rejected': int}.
+
+    """-------------------- Part A --------------------"""
+
+    new_rows = ingest(catalog, csv_path)
+
+    if new_rows != None:
+        with catalog.begin_transaction() as txn:
+            catalog.set_commit_message(f"q2: bronze ingest rentals_2026-06.csv")
+            txn.load_table(("bronze", "rentals_raw")).append(new_rows)
+
+        bronze_appended = new_rows.num_rows
+    else:
+        bronze_appended = 0
+
+    """-------------------- Part B --------------------"""
+
+    pending, clean = transform(catalog)
     with catalog.begin_transaction() as txn:
-        catalog.set_commit_message(f"q2: silver transform", author="jsudo")
+        catalog.set_commit_message(f"q2: silver transform")
         txn.load_table(("silver", "rentals")).append(clean)
-
-    # print(
-    #     f"{pending} bronze rows not yet in silver -> {clean.num_rows} appended, {pending - clean.num_rows} rejected by validation"
-    # )
 
     silver_appended = clean.num_rows
     rejected = int(pending - clean.num_rows)
@@ -305,12 +293,89 @@ def q4(  # DO NOT modify this line
     # transaction, "q4: silver corrections"; then count silver as it was at the
     # "q2: silver transform" snapshot. See the handout for every key.
 
-    q2(catalog, month2_csv)
-    q2(catalog, month1_csv)
+    silver = catalog.load_table(("silver", "rentals"))
+    con = catalog.connection
 
+    # Ingest July
+    ingested = ingest(catalog, month2_csv)
+    with catalog.begin_transaction() as txn:
+        catalog.set_commit_message(f"q4: bronze ingest rentals_2026-07.csv")
+        txn.load_table(("bronze", "rentals_raw")).append(ingested)
+
+    # Ingest June again (should be skipped)
+    _ = ingest(catalog, month1_csv)
+
+    bronze_appended = ingested.num_rows
+
+    # Transform
+    _, clean = transform(catalog)
+    with catalog.begin_transaction() as txn:
+        catalog.set_commit_message(f"q4: silver transform")
+        txn.load_table(("silver", "rentals")).append(clean)
+
+    silver_appended = clean.num_rows
+
+    # Apply corrections
+    corr = pacsv.read_csv(
+        corrections_csv,
+        convert_options=pacsv.ConvertOptions(
+            column_types={
+                "rental_id": pa.string(),
+                "action": pa.string(),
+                "fare_thb": pa.string(),
+            },
+            strings_can_be_null=True,  # blank cell -> NULL
+        ),
+    )
+    con.register("corrections", corr)
+    try:
+        refares = con.sql("""
+            WITH c AS (
+                SELECT
+                    trim(rental_id) AS rental_id,
+                    TRY_CAST(nullif(trim(fare_thb), '') AS DECIMAL(8, 2)) AS fare_thb
+                FROM (SELECT *, row_number() OVER () AS file_row_number FROM corrections)
+                WHERE lower(trim(action)) = 'refare'
+                QUALIFY row_number() OVER (PARTITION BY trim(rental_id) ORDER BY file_row_number DESC) = 1
+            )
+            SELECT
+                s.rental_id, s.member_id, s.bike_id, s.start_station, s.end_station,
+                s.status, s.started_at, s.ended_at,
+                c.fare_thb AS fare_thb,
+                s.ride_date
+            FROM lake.silver.rentals AS s
+            JOIN c ON c.rental_id = s.rental_id
+        """).to_arrow_table()
+
+        void_ids = [r[0] for r in con.sql("""
+            SELECT DISTINCT trim(rental_id) FROM corrections
+            WHERE lower(trim(action)) = 'void'
+        """).fetchall()]
+
+        with catalog.begin_transaction() as txn:
+            catalog.set_commit_message("q4: silver corrections")
+            table = txn.load_table(("silver", "rentals"))
+            if refares.num_rows > 0:
+                table.upsert(refares, join_cols=["rental_id"])
+            if void_ids:
+                quoted = ", ".join("'" + v.replace("'", "''") + "'" for v in void_ids)
+                table.delete(f"rental_id IN ({quoted})")
+    finally:
+        con.unregister("corrections")
+
+    rows_after_corrections = silver.scan().count()
+
+    # Time travel
     snaps = silver.inspect().snapshots().to_pandas()
     row = snaps[snaps.commit_message == "q2: silver transform"].iloc[0]
-    snap = row.snapshot_id
+    rows_after_q2 = silver.scan().with_snapshot(int(row.snapshot_id)).count()
+
+    return {
+        "bronze_appended": bronze_appended,
+        "silver_appended": silver_appended,
+        "rows_after_q2": rows_after_q2,
+        "rows_after_corrections": rows_after_corrections,
+    }
 
 
 if __name__ == "__main__":
