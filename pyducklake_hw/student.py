@@ -104,6 +104,8 @@ def q2(catalog: Catalog, csv_path: str):  # DO NOT modify this line
     # validated by the handout's rules, one per rental_id (QUALIFY).
     # Return {'bronze_appended': int, 'silver_appended': int, 'rejected': int}.
 
+    con = catalog.connection
+
     """-------------------- Part A --------------------"""
 
     file_bytes = Path(csv_path).read_bytes()
@@ -125,12 +127,12 @@ def q2(catalog: Catalog, csv_path: str):  # DO NOT modify this line
         ),
     )
     if raw.column_names != SOURCE_COLUMNS:
-        raise ValueError(f"Unexpected header in {csv_path.name}: {raw.column_names}")
+        raise ValueError(f"Unexpected header in {csv_path}: {raw.column_names}")
 
     # Add ingest metadata columns
     n = raw.num_rows
     batch = (
-        raw.append_column("source_file", pa.array([csv_path.name] * n, pa.string()))
+        raw.append_column("source_file", pa.array([csv_path] * n, pa.string()))
         .append_column("source_row_number", pa.array(range(1, n + 1), pa.int32()))
         .append_column("file_sha256", pa.array([file_hash] * n, pa.string()))
         .append_column(
@@ -140,7 +142,6 @@ def q2(catalog: Catalog, csv_path: str):  # DO NOT modify this line
     )
 
     # Guard 2: keep only rental_ids that are not in bronze yet (and the first copy inside this file)
-    con = catalog.connection
     con.register("incoming", batch)
     new_rows = con.sql("""
         SELECT *
@@ -161,7 +162,9 @@ def q2(catalog: Catalog, csv_path: str):  # DO NOT modify this line
     #     return 0
 
     with catalog.begin_transaction() as txn:
-        catalog.set_commit_message(f"bronze: ingest {csv_path.name}", author="jsudo")
+        catalog.set_commit_message(
+            f"q2: bronze ingest rentals_2026-06.csv", author="jsudo"
+        )
         txn.load_table(("bronze", "rentals_raw")).append(new_rows)
 
     bronze_appended = new_rows.num_rows
@@ -186,17 +189,17 @@ def q2(catalog: Catalog, csv_path: str):  # DO NOT modify this line
             trim(bike_id)                                   AS bike_id,
             trim(start_station)                             AS start_station,
             trim(end_station)                               AS end_station,
-            trim(status)                                    AS status,
+            lower(trim(status))                             AS status,
             TRY_CAST(started_at AS TIMESTAMPTZ)             AS started_at,
             TRY_CAST(ended_at AS TIMESTAMPTZ)               AS ended_at,
-            TRY_CAST(fare_thb AS DECIMAL(8, 2))             AS fare_thb)
+            TRY_CAST(fare_thb AS DECIMAL(8, 2))             AS fare_thb,
             ingested_at
         FROM new_rows
     ),
     derived AS (                     --    derive date in Bangkok local time
         SELECT
             *,
-            CAST(timezone('Asia/Bangkok', requested_at) AS DATE) AS ride_date,
+            CAST(timezone('Asia/Bangkok', started_at) AS DATE) AS ride_date,
         FROM typed
     )
     SELECT                           -- 3. validate; column order matches silver.rentals
@@ -208,24 +211,20 @@ def q2(catalog: Catalog, csv_path: str):  # DO NOT modify this line
     AND member_id IS NOT NULL
     AND bike_id IS NOT NULL
     AND start_station IN ('Siam', 'Samyan', 'Chamchuri', 'Lumphini', 'Silom')
-    AND end_station IN (NULL, 'Siam', 'Samyan', 'Chamchuri', 'Lumphini', 'Silom')
     AND status IS NOT NULL
-    AND started_at <= ended_at
     AND (
-           (status = 'completed'
-            AND picked_up_at IS NOT NULL AND completed_at IS NOT NULL
-            AND accepted_at <= picked_up_at AND picked_up_at <= completed_at
+        status = 'lost'
+        OR (
+            status = 'completed'
+            AND ended_at IS NOT NULL AND started_at < ended_at 
             AND fare_thb IS NOT NULL AND fare_thb >= 0
-            AND cancelled_at IS NULL)
-        OR (status = 'cancelled'
-            AND cancelled_at IS NOT NULL AND accepted_at <= cancelled_at
-            AND picked_up_at IS NULL AND completed_at IS NULL AND fare_thb IS NULL)
+        )
     )
     QUALIFY row_number() OVER (PARTITION BY rental_id ORDER BY ingested_at) = 1   -- one row per rental_id
-    ORDER BY requested_at
+    ORDER BY started_at
     """
 
-    # Move new, valid bronze rows into silver.trips. Returns the number of rows appended.
+    # Move new, valid bronze rows into silver.rentals. Returns the number of rows appended.
     pending = con.sql("""
         SELECT count(*) AS n FROM lake.bronze.rentals_raw AS b
         WHERE NOT EXISTS (SELECT 1 FROM lake.silver.rentals AS s WHERE s.rental_id = b.rental_id)
@@ -239,17 +238,15 @@ def q2(catalog: Catalog, csv_path: str):  # DO NOT modify this line
     #     return 0
 
     with catalog.begin_transaction() as txn:
-        catalog.set_commit_message(
-            f"silver: transform {clean.num_rows} new trips", author="jsudo"
-        )
-        txn.load_table(("silver", "trips")).append(clean)
+        catalog.set_commit_message(f"q2: silver transform", author="jsudo")
+        txn.load_table(("silver", "rentals")).append(clean)
 
     # print(
     #     f"{pending} bronze rows not yet in silver -> {clean.num_rows} appended, {pending - clean.num_rows} rejected by validation"
     # )
 
     silver_appended = clean.num_rows
-    rejected = pending - clean.num_rows
+    rejected = int(pending - clean.num_rows)
 
     return {
         "bronze_appended": bronze_appended,
@@ -263,7 +260,41 @@ def q3(catalog: Catalog):  # DO NOT modify this line
     # Return {'silver_rows': int, 'lost_rentals': int,
     #         'revenue_by_station': {station: float, rounded to 2, all 5 Stations},
     #         'rejected_ids': sorted rental_ids in bronze with no silver row}.
-    raise NotImplementedError("q3 isn't answered yet")
+
+    con = catalog.connection
+
+    with catalog.begin_transaction() as txn:
+        table = txn.load_table(("silver", "rentals"))
+        silver_rows = table.scan().count()
+        lost_rentals = table.scan("status = 'lost'").count()
+
+        revenue_rows = con.sql("""
+            SELECT st.station, round(coalesce(sum(s.fare_thb), 0), 2) AS revenue
+            FROM (VALUES ('Siam'), ('Samyan'), ('Chamchuri'), ('Lumphini'), ('Silom')) AS st(station)
+            LEFT JOIN lake.silver.rentals AS s ON s.start_station = st.station AND s.status = 'completed'
+            GROUP BY st.station
+        """).fetchall()
+        by_station = {station: float(revenue) for station, revenue in revenue_rows}
+        revenue_by_station = {
+            st: by_station[st]
+            for st in ("Siam", "Samyan", "Chamchuri", "Lumphini", "Silom")
+        }
+
+        rejected_ids = [r[0] for r in con.sql("""
+            SELECT rental_id FROM lake.bronze.rentals_raw AS b
+            WHERE NOT EXISTS (
+                SELECT 1 FROM lake.silver.rentals AS s WHERE s.rental_id = b.rental_id
+            )
+            AND rental_id IS NOT NULL
+            ORDER BY rental_id
+        """).fetchall()]
+
+    return {
+        "silver_rows": silver_rows,
+        "lost_rentals": lost_rentals,
+        "revenue_by_station": revenue_by_station,
+        "rejected_ids": rejected_ids,
+    }
 
 
 def q4(  # DO NOT modify this line
@@ -273,7 +304,13 @@ def q4(  # DO NOT modify this line
     # transform; apply the Corrections (refares with upsert, voids with delete) in ONE
     # transaction, "q4: silver corrections"; then count silver as it was at the
     # "q2: silver transform" snapshot. See the handout for every key.
-    raise NotImplementedError("q4 isn't answered yet")
+
+    q2(catalog, month2_csv)
+    q2(catalog, month1_csv)
+
+    snaps = silver.inspect().snapshots().to_pandas()
+    row = snaps[snaps.commit_message == "q2: silver transform"].iloc[0]
+    snap = row.snapshot_id
 
 
 if __name__ == "__main__":
