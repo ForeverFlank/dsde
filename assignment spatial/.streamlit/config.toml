@@ -1,0 +1,9 @@
+[server]
+# Serve files in ./static at http://localhost:8501/app/static/ (offline basemap)
+enableStaticServing = true
+# Fixed port: static/style.json hard-codes 8501
+port = 8501
+
+[browser]
+# No usage statistics (no internet needed)
+gatherUsageStats = false
