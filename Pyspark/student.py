@@ -16,23 +16,20 @@ def q2(df: DataFrame):  # DO NOT modify this line
     # Which video has the most number of comments?
     # Return the video_id with the most comments (string)
 
-    result = df.orderBy(F.desc("comments")).first()
-
-    return result["video_id"]
+    return df.select(df.video_id).orderBy(df.comments.desc()).first().video_id
 
 
 def q3(df: DataFrame):  # DO NOT modify this line
     # Which category has the most number of videos?
     # Return the category_id (integer)
 
-    result = (
-        df.groupBy("category_id")
-        .agg(F.countDistinct("video_id").alias("video_count"))
-        .orderBy(F.desc("video_count"))
+    return (
+        df.groupBy(df.category_id)
+        .agg(F.count("*").alias("c"))
+        .orderBy(F.desc("c"))
         .first()
+        .category_id
     )
-
-    return int(result["category_id"])
 
 
 def q4(df: DataFrame):  # DO NOT modify this line
@@ -41,16 +38,10 @@ def q4(df: DataFrame):  # DO NOT modify this line
     # Skip videos with 0 views: the grader runs Spark 4, where dividing by 0 is an error
     # Return the highest like_ratio (float)
 
-    result = (
-        df.filter(F.col("views") > 0)
-        .withColumn(
-            "like_ratio", F.col("likes").cast("double") / F.col("views").cast("double")
-        )
-        .agg(F.max("like_ratio").alias("max_like_ratio"))
-        .first()
-    )
+    filtered = df.filter(df.views > 0)
+    like_ratios = filtered.select((df.likes / df.views).alias("ratio"))
 
-    return float(result["max_like_ratio"])
+    return like_ratios.orderBy(F.desc("ratio")).first().ratio
 
 
 if __name__ == "__main__":
